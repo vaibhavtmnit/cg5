@@ -1,41 +1,43 @@
 # object_instantiation_extractor_and_validator.py
-# Object Instantiation — extractor + validator using TypedDict only.
-# Nuances implemented:
-#  • Children are all instantiations directly related to the focus.
-#  • If a variable is bound to the new instance AND that variable is later used in the same scope,
-#    add BOTH children: the instantiated TYPE and the VARIABLE (two ECs), each with the ENTIRE line as code_snippet.
-#  • If an instantiation is used ONLY as an argument (e.g., call(new Foo())), return ONLY the TYPE child for that line.
-#  • Exclude lambda/anonymous-class internals; exclude trivial/logging utilities via denylist.
-#  • Two independent runs (original and NL per-line) then merge by 'name' with shortest snippet/block and max confidence.
+# Updated Object Instantiation — extractor + validator (TypedDict only)
+# Rules implemented:
+#  • Return variables created from a class (NOT class names).
+#  • If created from another variable’s method call (e.g., Gome g = v.create()), return TWO children: 'g' and 'v'.
+#  • If instantiation is used only as an argument (call(new Foo())), return nothing (Argument tracker handles it).
+#  • For field assignment x.helper = new Helper(); return ONLY 'helper'.
+#  • Handle multiple occurrences of the SAME name on the SAME line with `variant` (0,1,...) and `comment`.
+#  • Two runs: original code, NL per line → merge by (name, code_snippet, comment).
 #
 # Requires:
 #   pip install langchain langchain-openai
 
 from __future__ import annotations
-from typing import TypedDict, List, Dict, Any, Optional
+from typing import TypedDict, List, Dict, Any, Optional, Tuple
 import json
 
 from langchain_openai import AzureChatOpenAI
 from langchain.schema import SystemMessage, HumanMessage
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# TypedDicts — per your schema
+# TypedDicts — EC shape now includes variant + comment
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EC(TypedDict):
-    name: str               # for instantiation: class simple name (e.g., "Foo"); for variable-child: variable name (e.g., "f")
-    code_snippet: str       # ENTIRE original code line containing the instantiation (or variable usage line, see rules)
-    code_block: str         # smallest original block showing parent + child + relation (can be same as snippet)
-    further_expand: bool    # leave False by default; orchestrator decides expansion later
+    name: str               # variable/field name created or used as source on that line
+    code_snippet: str       # ENTIRE original line containing the creation/assignment
+    code_block: str         # smallest block showing parent+child relation (can be same as snippet)
+    further_expand: bool
     confidence: float
-    conditioned: bool       # True if under explicit condition/ternary/loop/try
-    guards: List[str]       # optional guard strings ([] if none)
+    conditioned: bool
+    guards: List[str]
+    # NEW:
+    comment: str            # brief hint: "instantiated variable", "source variable for 'g' on same line", etc.
+    variant: int            # 0-based index for same-name occurrences on the SAME line (left-to-right)
 
 class InstantiationInput(TypedDict):
-    object_name: str               # focus (method | object variable | call_result); LLM infers relevance by rules below
+    object_name: str               # focus name (method, object var, or call-result)
     java_code: str                 # full source text
-    java_code_line: int            # 1-based anchor line (occurrence to analyze)
+    java_code_line: int            # 1-based anchor line
     java_code_line_content: str    # exact code on that line
     analytical_chain: str          # up to two predecessors, "a->b->c"
 
@@ -83,39 +85,54 @@ def _norm_ec_list(items: List[Dict[str, Any]]) -> List[EC]:
             "confidence": float(it.get("confidence", 0.0)),
             "conditioned": bool(it.get("conditioned", False)),
             "guards": list(it.get("guards", []) or []),
+            "comment": str(it.get("comment", "")).strip(),
+            "variant": int(it.get("variant", 0)),
         }
         if not ec["name"]:
             continue
         # clamp confidence
         if ec["confidence"] < 0.0: ec["confidence"] = 0.0
         if ec["confidence"] > 1.0: ec["confidence"] = 1.0
+        # clamp variant
+        if ec["variant"] < 0: ec["variant"] = 0
         out.append(ec)
     return out
 
-def _merge_by_name(a: List[EC], b: List[EC]) -> List[EC]:
+def _merge_key(ec: EC) -> Tuple[str, str, str]:
+    """Composite merge key that preserves same-name variants on the same line."""
+    return (ec["name"], ec["code_snippet"], ec.get("comment", ""))
+
+def _merge_ecs(a: List[EC], b: List[EC]) -> List[EC]:
     """
-    Merge EC lists by 'name'. Keep shortest blocks/snippets, max confidence.
-    Union guards; OR conditioned; OR further_expand.
+    Merge by composite key (name, code_snippet, comment) to preserve same-name duplicates on the same line.
+    Keep shortest code_block, highest confidence; OR flags; union guards; prefer lower variant if conflict.
     """
-    by: Dict[str, EC] = {}
+    by: Dict[Tuple[str, str, str], EC] = {}
     def push(lst: List[EC]):
         for it in lst:
-            nm = it["name"]
-            if nm not in by:
-                by[nm] = it
+            key = _merge_key(it)
+            if key not in by:
+                by[key] = it
             else:
-                cur = by[nm]
+                cur = by[key]
+                # prefer shorter code_block/snippet
                 if it["code_block"] and (not cur["code_block"] or len(it["code_block"]) < len(cur["code_block"])):
                     cur["code_block"] = it["code_block"]
                 if it["code_snippet"] and (not cur["code_snippet"] or len(it["code_snippet"]) < len(cur["code_snippet"])):
                     cur["code_snippet"] = it["code_snippet"]
+                # max confidence
                 if it["confidence"] > cur["confidence"]:
                     cur["confidence"] = it["confidence"]
+                # OR flags / union guards
                 cur["conditioned"] = cur["conditioned"] or it["conditioned"]
-                cur["guards"] = list(dict.fromkeys(cur.get("guards", []) + it.get("guards", [])))
                 cur["further_expand"] = cur["further_expand"] or it["further_expand"]
+                cur["guards"] = list(dict.fromkeys(cur["guards"] + it["guards"]))
+                # prefer smaller variant if conflict
+                if it["variant"] < cur["variant"]:
+                    cur["variant"] = it["variant"]
     push(a); push(b)
-    return [by[k] for k in sorted(by.keys())]
+    # deterministic ordering: by code_snippet line first, then variant, then name
+    return sorted(by.values(), key=lambda ec: (ec["code_snippet"], ec["variant"], ec["name"]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,62 +140,60 @@ def _merge_by_name(a: List[EC], b: List[EC]) -> List[EC]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _RUNA_SYSTEM = """
-Task: Extract OBJECT INSTANTIATIONS directly related to the FOCUS, using ONLY the original Java code.
-Return STRICT JSON. Prefer empty results over guesses.
+Task: Extract OBJECT INSTANTIATION CHILDREN according to these strict rules. Return STRICT JSON only.
 
-Interpret the focus and apply relevance:
-• FOCUS = METHOD → include instantiations inside that method body:
-  - 'Type v = new Type(...);'  → child TYPE 'Type'
-  - If 'v' is later used as an object (receiver or argument) in the same method, ALSO add child VARIABLE 'v'.
-  - 'call(new Type(...))' or 'sink.accept(new Type(...))' → add ONLY child TYPE 'Type' for that line.
-  - 'new Type(...).init()' (no variable bound) → add ONLY child TYPE 'Type'.
-• FOCUS = OBJECT VARIABLE X → include instantiations that create or directly affect X:
-  - 'XType X = new XType(...);' → child TYPE 'XType'  (do NOT add a child for 'X' here; X is the focus itself)
-  - 'X.field = new Type(...);' → child TYPE 'Type'  (instantiation stored into a field of the focus)
-  - 'call(new Type(X))' (focus passed into constructor) → add ONLY child TYPE 'Type'.
-• FOCUS = CALL_RESULT → usually no direct instantiation; include only if the same statement builds the call result via 'new'.
+What to return as children (variables only, never class names):
+1) Direct constructor assignment (declaration or reassignment):
+   - Example: "Foo f = new Foo(...);" → child 'f' with code_snippet as the entire line; comment "instantiated variable".
+2) Variable created FROM ANOTHER VARIABLE'S method call on the same line:
+   - Example: "Gome g = v.create();" → children 'g' (comment "instantiated variable") AND 'v'
+     (comment "source variable for 'g' on same line"); both use the entire line as code_snippet.
+   - Chained call variant: "Gome g = v.create().tune();" → children 'g' and 'v' (no 'tune').
+3) Field assignment on focused object only:
+   - Example: "x.helper = new Helper();" with focus 'x' → child 'helper' only (comment "field instantiated on focus").
+4) Multi-statements on the SAME line:
+   - Example: "Foo a = new Foo(); Bar b = a.make();" → children: 'a' (instantiated variable), 'b' (instantiated variable),
+     and 'a' again (comment "source variable for 'b' on same line").
+   - For SAME-NAME children on the SAME line, assign variant indices 0,1,... in left-to-right order of their occurrences on that line.
+5) EXCLUDE:
+   - Instantiations used ONLY as arguments (e.g., "call(new Foo())") → return nothing here.
+   - Unbound 'new' used only in a chain (e.g., "new Foo().init()") → return nothing here.
+   - Anything inside lambda/anonymous-class bodies.
+   - Denylisted trivial/logging utilities.
+6) Focus-aware:
+   - Focus=METHOD: include locals declared/reassigned in that method; do NOT include fields unless receiver is 'this' AND you can infer 'this' is the focus (otherwise exclude).
+   - Focus=OBJECT VAR X: include 'X.field = new T()' as 'field'; include 'Type y = X.make()' as 'y' AND 'X' on that line.
+   - Focus=CALL_RESULT: include 'Var r = <focusCall>().next()' as 'r'.
 
-Mandatory exclusions:
-• Do NOT include instantiations that occur only inside lambda/anonymous-class bodies.
-• Do NOT include denylisted trivial/logging utilities.
-• Prefer the occurrence nearest to ANCHOR_LINE within the same enclosing method/initializer.
-
-For each kept item, produce an EC:
-  {"name":"<Type or Variable>", "code_snippet":"<ENTIRE line>", "code_block":"<smallest original block>",
-   "further_expand": false, "confidence": 0.0-1.0, "conditioned": false, "guards":[]}
+For each child produce an EC:
+{"name":"<var or field>", "code_snippet":"<ENTIRE line>", "code_block":"<smallest original block>",
+ "further_expand": false, "confidence": 0.0-1.0, "conditioned": false, "guards": [],
+ "comment":"<reason as per the cases above>", "variant": <0-based index for same-name in same line>}
 """.strip()
 
 _RUNA_FEWSHOTS = """
-Few-shot examples (synthetic):
+Examples (diverse):
 
-1) Method focus, with later usage
-void m(){
-  Foo f = new Foo(a);
-  f.run();
-  log.debug("x");
-}
-Focus: m → children: ['Foo', 'f']  // 'Foo' from instantiation, 'f' because later used as object
-Both EC.code_snippet should be the ENTIRE line "Foo f = new Foo(a);"
+1) Method focus
+void m(){ Foo f = new Foo(); f.run(); }
+→ children: {"name":"f","comment":"instantiated variable","variant":0}
 
-2) Method focus, instantiation as arg (no variable)
-void m(){ call(new Bar()); }
-Focus: m → children: ['Bar'] ONLY (from 'new Bar()'). No extra child.
+2) From another variable's method
+void m(){ Gome g = v.create(); }
+→ children: {"name":"g","comment":"instantiated variable","variant":0},
+            {"name":"v","comment":"source variable for 'g' on same line","variant":0}
 
-3) Method focus, chained right after new
-void m(){ new Baz().init(); }
-Focus: m → children: ['Baz'] ONLY.
+3) Multi-statements same line
+void m(){ Foo a = new Foo(); Bar b = a.make(); }
+→ children: a(instantiated, variant 0), b(instantiated, variant 0), a(source for 'b', variant 1)
 
-4) Object focus X, constructor of X
-void m(){ X x = new X(); x.work(); }
-Focus: x → children: ['X'] ONLY  // do not add a child for 'x' itself
+4) Field on focus object
+void m(X x){ x.helper = new Helper(); }
+Focus: x → child: {"name":"helper","comment":"field instantiated on focus","variant":0}
 
-5) Object focus X, field assigned a new
-void m(){ x.helper = new Helper(); }
-Focus: x → children: ['Helper']
-
-6) Ignore lambda internals
-void m(){ items.forEach(it -> { Helper h = new Helper(); }); }
-Focus: m → [] (instantiation inside lambda only)
+5) Exclusions
+void m(){ call(new Foo()); new Bar().init(); items.forEach(t -> { Temp u = new Temp(); }); }
+→ no children for these lines
 """.strip()
 
 def _build_run_a_user(
@@ -199,39 +214,36 @@ def _build_run_a_user(
         "CODE:\n"
         f"{code}\n\n"
         f"{_RUNA_FEWSHOTS}\n"
-        'Output JSON schema: {"children":[EC,...]}\n'
-        "Return ONLY the JSON object."
+        'Output JSON: {"children":[EC,...]} ONLY.'
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXTRACTOR — Run B: per-line NL → re-extract
+# EXTRACTOR — Run B: NL per line → re-extract
 # ─────────────────────────────────────────────────────────────────────────────
 
 _EXPLAIN_LINES_SYSTEM = """
 Convert the Java code to concise, factual natural language, ONE sentence per original line (1-based).
-Preserve identifiers and 'new Type(...)' constructs; indicate variable names and whether the line is a call, assignment, or declaration.
-No speculation. No added/removed lines.
+Preserve variable declarations/assignments, 'new' constructs, field assignments, and simple chains.
+Indicate same-line multiple statements in the same original line index.
 Return STRICT JSON: {"lines":[{"line":int,"text":str}, ...]}
 """.strip()
 
 _RUNB_SYSTEM = """
-Using the per-line explanations, extract OBJECT INSTANTIATIONS directly related to the focus, with the same rules as in the original-code run.
-Apply the special rule:
-• If a variable is bound to 'new' AND the variable is later used as an object in the same method, emit TWO ECs: the TYPE and the VARIABLE (both with ENTIRE instantiation line as code_snippet).
-• If the instantiation is used only as an argument or in a chained call with no variable bound, emit ONLY the TYPE EC.
+Using the per-line explanations, repeat the SAME extraction:
+• Return only variable/field children (no class names).
+• If created from another variable’s method call, include both the new variable and the source variable (with comments).
+• For SAME-NAME children on the SAME line, assign variant indices 0,1,... in left-to-right order for that line.
+• Exclude instantiation-only arguments, unbound 'new' chains, lambda/anon internals, denylisted utilities.
 
-Return STRICT JSON: {"children":[EC,...]}.
-Prefer empty results over guesses.
+Return STRICT JSON: {"children":[EC,...]}. Prefer empty over guesses.
 """.strip()
 
 _RUNB_FEWSHOTS = """
-Few-shot hints in NL:
-
-- "line 10: declare Foo f = new Foo(a)" and later "line 12: f.run()" → emit 'Foo' and 'f' (same instantiation line as snippet)
-- "line 7: call(new Bar())" → emit 'Bar' only
-- "line 5: new Baz().init()" → emit 'Baz' only
-- "line 18: x.helper = new Helper()" with focus x → emit 'Helper'
+Hints in NL:
+- "line 7: declare Foo a = new Foo(); then Bar b = a.make()" → a(instantiated, variant 0), b(instantiated, v0), a(source for 'b', v1)
+- "line 12: x.helper assigned new Helper()" with focus x → child 'helper'
+- "line 14: call(new Foo())" → no child
 """.strip()
 
 def _build_run_b_user(
@@ -252,8 +264,7 @@ def _build_run_b_user(
         "LINES_NL (JSON array of {line:int,text:str}):\n"
         f"{explained_json}\n\n"
         f"{_RUNB_FEWSHOTS}\n"
-        'Output JSON schema: {"children":[EC,...]}\n'
-        "Return ONLY the JSON object."
+        "Return ONLY the JSON object with schema: {'children':[EC,...]}."
     )
 
 
@@ -268,12 +279,8 @@ def extract_object_instantiations(
     denylist: Optional[List[str]] = None,
 ) -> List[EC]:
     """
-    Extract Object Instantiation children according to the rules:
-      • Method focus: instantiations in body; add TYPE; add VARIABLE too if later used as object (both with full line as snippet).
-      • Object focus (variable): TYPE that constructs or is assigned into its fields; do NOT add the focus variable itself.
-      • Call-result focus: typically none, unless the result is directly created via 'new' in the same statement.
-
-    Two runs (original + NL) → merge by 'name'.
+    Extract variable/field children created from instantiation under the specified rules.
+    Two runs (original + NL per-line) → merge by (name, code_snippet, comment) to preserve same-name duplicates.
     """
     focus = request["object_name"]
     code = request["java_code"]
@@ -295,8 +302,7 @@ def extract_object_instantiations(
     a_children = _norm_ec_list(out_a.get("children", []))
 
     # Run B — explain → extract
-    explain_user = "CODE:\n" + code
-    explained = _invoke_json(llm, system=_EXPLAIN_LINES_SYSTEM, user=explain_user)
+    explained = _invoke_json(llm, system=_EXPLAIN_LINES_SYSTEM, user="CODE:\n" + code)
     explained_json = json.dumps(explained.get("lines", []), ensure_ascii=False)
 
     user_b = _build_run_b_user(
@@ -311,7 +317,7 @@ def extract_object_instantiations(
     b_children = _norm_ec_list(out_b.get("children", []))
 
     # Merge and return
-    return _merge_by_name(a_children, b_children)
+    return _merge_ecs(a_children, b_children)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -319,51 +325,31 @@ def extract_object_instantiations(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _VALIDATOR_SYSTEM = """
-You validate Object Instantiation candidates relative to the FOCUS.
-Return STRICT JSON.
+You validate Object Instantiation children relative to the FOCUS.
+Return STRICT JSON only.
 
 Validity rules:
-• METHOD focus:
-  - Valid TYPE if the method body contains a 'new Type(...)' instantiation (outside lambda/anonymous classes).
-  - Valid VARIABLE if it is declared on the same line as 'new Type(...)' AND that variable is later used as an object
-    (receiver or argument) within the same method. Use the ENTIRE instantiation line as the code_snippet for both ECs.
-  - If an instantiation is used only as an argument or chained immediately (no variable bound), ONLY the TYPE is valid.
-• OBJECT VARIABLE focus:
-  - Valid TYPE if it constructs the focus (e.g., 'X x = new X(...)') or assigns a new into a field of the focus (e.g., 'x.f = new Y(...)').
-  - Do NOT validate a separate VARIABLE child for the focus variable itself.
-• CALL_RESULT focus:
-  - Valid TYPE only if the call result is directly created via 'new' in the same statement; otherwise invalid.
+• Return children ONLY for variables/fields (never class names).
+• Direct constructor assignment (declaration or reassignment): child is the LHS variable ("instantiated variable").
+• Created from another variable's method call: return TWO children:
+   - new variable (comment "instantiated variable")
+   - source variable (comment "source variable for '<newVar>' on same line")
+• Field on focused object: 'x.field = new T()' with focus 'x' → child 'field' ONLY (comment "field instantiated on focus").
+• Multi-statements on the SAME line: allow duplicate names; SAME-LINE duplicates must have 'variant' indices 0,1,... in left-to-right order.
+• Exclusions: instantiation-only arguments (call(new T())), unbound 'new' chains (new T().init()), lambda/anon internals, denylisted utilities.
 
-Exclusions:
-• Ignore instantiations inside lambda/anonymous-class bodies.
-• Ignore denylisted trivial/logging utilities.
-
-For each candidate EC, output: {"name","valid":bool,"confidence":0.0-1.0,"reason":str}.
-Prefer empty over guesses.
+For each candidate EC, output:
+{"name":"...","valid":true|false,"confidence":0..1,"reason":"..."}
 """.strip()
 
 _VALIDATOR_FEWSHOTS = """
-Few-shot examples:
+Examples:
 
-1) Method focus; var later used
-void m(){ Foo f = new Foo(); f.run(); }
-Candidates: ['Foo','f'] → both valid (same instantiation line as snippet)
-
-2) Method focus; arg-only
-void m(){ call(new Bar()); }
-Candidates: ['Bar','temp'] → 'Bar' valid; 'temp' invalid (no variable bound)
-
-3) Method focus; chained after new
-void m(){ new Baz().init(); }
-Candidates: ['Baz','x'] → 'Baz' valid; 'x' invalid
-
-4) Object focus x
-void m(){ X x = new X(); x.helper = new H(); }
-Focus: x → valid: 'X','H' ; invalid: 'x' (focus itself not added)
-
-5) Lambda-internal new ignored
-void m(){ items.forEach(it -> { Q q = new Q(); }); }
-Focus: m → 'Q' invalid (inside lambda only)
+1) "Foo f = new Foo();" → 'f' valid ("instantiated variable")
+2) "Gome g = v.create();" → 'g' valid; 'v' valid ("source variable for 'g' on same line")
+3) "Foo a = new Foo(); Bar b = a.make();" → 'a'(instantiated, variant 0), 'b'(instantiated, v0), 'a'(source, variant 1) all valid
+4) "x.helper = new Helper();" with focus 'x' → 'helper' valid; 'Helper' invalid
+5) "call(new Foo()); new Bar().init();" → none valid
 """.strip()
 
 def validate_object_instantiations(
