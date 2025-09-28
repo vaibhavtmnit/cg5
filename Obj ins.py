@@ -1,45 +1,42 @@
-# object_instantiation_extractor_and_validator.py
-# Updated Object Instantiation — extractor + validator (TypedDict only)
-# Rules implemented:
-#  • Return variables created from a class (NOT class names).
-#  • If created from another variable’s method call (e.g., Gome g = v.create()), return TWO children: 'g' and 'v'.
-#  • If instantiation is used only as an argument (call(new Foo())), return nothing (Argument tracker handles it).
-#  • For field assignment x.helper = new Helper(); return ONLY 'helper'.
-#  • Handle multiple occurrences of the SAME name on the SAME line with `variant` (0,1,...) and `comment`.
-#  • Two runs: original code, NL per line → merge by (name, code_snippet, comment).
+# object_instantiation_pipeline.py
+# End-to-end "Approach A" pipeline:
+#   Phase-1: instantiations-only (variables/fields) within focus scope
+#   Phase-2: eligible uses of those variables (and optional external-in-scope vars), excluding argument uses
+#   Single validator: validates the relationship between Phase-1 and Phase-2 outputs
 #
 # Requires:
 #   pip install langchain langchain-openai
 
 from __future__ import annotations
-from typing import TypedDict, List, Dict, Any, Optional, Tuple
+from typing import TypedDict, List, Dict, Any, Optional, Tuple, Set
 import json
 
 from langchain_openai import AzureChatOpenAI
 from langchain.schema import SystemMessage, HumanMessage
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# TypedDicts — EC shape now includes variant + comment
+# Types
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EC(TypedDict):
-    name: str               # variable/field name created or used as source on that line
-    code_snippet: str       # ENTIRE original line containing the creation/assignment
-    code_block: str         # smallest block showing parent+child relation (can be same as snippet)
+    name: str
+    code_snippet: str
+    code_block: str
     further_expand: bool
     confidence: float
     conditioned: bool
     guards: List[str]
-    # NEW:
-    comment: str            # brief hint: "instantiated variable", "source variable for 'g' on same line", etc.
+    comment: str            # e.g. "instantiated variable", "source variable for 'g' on same line", "field instantiated on focus", "used as receiver", ...
     variant: int            # 0-based index for same-name occurrences on the SAME line (left-to-right)
 
-class InstantiationInput(TypedDict):
-    object_name: str               # focus name (method, object var, or call-result)
-    java_code: str                 # full source text
-    java_code_line: int            # 1-based anchor line
-    java_code_line_content: str    # exact code on that line
-    analytical_chain: str          # up to two predecessors, "a->b->c"
+class PipelineInput(TypedDict):
+    object_name: str
+    java_code: str
+    java_code_line: int
+    java_code_line_content: str
+    analytical_chain: str
+    include_external_uses: bool  # Phase-2: also show external-in-scope uses
 
 class VerdictTD(TypedDict):
     name: str
@@ -47,9 +44,13 @@ class VerdictTD(TypedDict):
     confidence: float
     reason: str
 
+class PipelineResult(TypedDict):
+    instantiations: List[EC]
+    uses: List[EC]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Utilities
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_DENYLIST = [
@@ -62,17 +63,14 @@ DEFAULT_DENYLIST = [
 ]
 
 def _invoke_json(llm: AzureChatOpenAI, *, system: str, user: str, retry: bool = True) -> Any:
-    """Call the LLM and parse a single JSON object. Retry once with a 'strict JSON' reminder if needed."""
     msgs = [SystemMessage(content=system), HumanMessage(content=user)]
     try:
-        txt = llm.invoke(msgs).content
-        return json.loads(txt)
+        return json.loads(llm.invoke(msgs).content)
     except Exception:
         if not retry:
             raise
-        user2 = user + "\n\nREMINDER: Return ONLY a valid JSON object. If nothing, return {'children': []}."
-        txt = llm.invoke([SystemMessage(content=system), HumanMessage(content=user2)]).content
-        return json.loads(txt)
+        user2 = user + "\n\nREMINDER: Return ONLY a valid JSON object. If nothing, return {\"children\": []}."
+        return json.loads(llm.invoke([SystemMessage(content=system), HumanMessage(content=user2)]).content)
 
 def _norm_ec_list(items: List[Dict[str, Any]]) -> List[EC]:
     out: List[EC] = []
@@ -90,304 +88,345 @@ def _norm_ec_list(items: List[Dict[str, Any]]) -> List[EC]:
         }
         if not ec["name"]:
             continue
-        # clamp confidence
-        if ec["confidence"] < 0.0: ec["confidence"] = 0.0
-        if ec["confidence"] > 1.0: ec["confidence"] = 1.0
-        # clamp variant
-        if ec["variant"] < 0: ec["variant"] = 0
+        ec["confidence"] = max(0.0, min(1.0, ec["confidence"]))
+        if ec["variant"] < 0:
+            ec["variant"] = 0
         out.append(ec)
     return out
 
-def _merge_key(ec: EC) -> Tuple[str, str, str]:
-    """Composite merge key that preserves same-name variants on the same line."""
+def _merge_key_with_comment(ec: EC) -> Tuple[str, str, str]:
+    # Preserve same-name duplicates on the same line by including code_snippet + comment in key
     return (ec["name"], ec["code_snippet"], ec.get("comment", ""))
 
-def _merge_ecs(a: List[EC], b: List[EC]) -> List[EC]:
+def _merge_ec_lists(a: List[EC], b: List[EC]) -> List[EC]:
     """
-    Merge by composite key (name, code_snippet, comment) to preserve same-name duplicates on the same line.
-    Keep shortest code_block, highest confidence; OR flags; union guards; prefer lower variant if conflict.
+    Merge two EC lists while preserving duplicates (variants).
+    Key: (name, code_snippet, comment)
+    Keep shorter code_block, higher confidence; OR flags; union guards; prefer smaller variant on conflict.
     """
     by: Dict[Tuple[str, str, str], EC] = {}
     def push(lst: List[EC]):
         for it in lst:
-            key = _merge_key(it)
+            key = _merge_key_with_comment(it)
             if key not in by:
                 by[key] = it
             else:
                 cur = by[key]
-                # prefer shorter code_block/snippet
                 if it["code_block"] and (not cur["code_block"] or len(it["code_block"]) < len(cur["code_block"])):
                     cur["code_block"] = it["code_block"]
-                if it["code_snippet"] and (not cur["code_snippet"] or len(it["code_snippet"]) < len(cur["code_snippet"])):
-                    cur["code_snippet"] = it["code_snippet"]
-                # max confidence
                 if it["confidence"] > cur["confidence"]:
                     cur["confidence"] = it["confidence"]
-                # OR flags / union guards
+                cur["guards"] = list(dict.fromkeys(cur["guards"] + it["guards"]))
                 cur["conditioned"] = cur["conditioned"] or it["conditioned"]
                 cur["further_expand"] = cur["further_expand"] or it["further_expand"]
-                cur["guards"] = list(dict.fromkeys(cur["guards"] + it["guards"]))
-                # prefer smaller variant if conflict
                 if it["variant"] < cur["variant"]:
                     cur["variant"] = it["variant"]
     push(a); push(b)
-    # deterministic ordering: by code_snippet line first, then variant, then name
+    # deterministic ordering
     return sorted(by.values(), key=lambda ec: (ec["code_snippet"], ec["variant"], ec["name"]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXTRACTOR — Run A: original code
+# Phase-1 — Instantiations only (no NL pass)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_RUNA_SYSTEM = """
-Task: Extract OBJECT INSTANTIATION CHILDREN according to these strict rules. Return STRICT JSON only.
+_PHASE1_SYSTEM = """
+You extract ONLY variable/field creations within the FOCUS SCOPE.
 
-What to return as children (variables only, never class names):
-1) Direct constructor assignment (declaration or reassignment):
-   - Example: "Foo f = new Foo(...);" → child 'f' with code_snippet as the entire line; comment "instantiated variable".
-2) Variable created FROM ANOTHER VARIABLE'S method call on the same line:
-   - Example: "Gome g = v.create();" → children 'g' (comment "instantiated variable") AND 'v'
-     (comment "source variable for 'g' on same line"); both use the entire line as code_snippet.
-   - Chained call variant: "Gome g = v.create().tune();" → children 'g' and 'v' (no 'tune').
-3) Field assignment on focused object only:
-   - Example: "x.helper = new Helper();" with focus 'x' → child 'helper' only (comment "field instantiated on focus").
-4) Multi-statements on the SAME line:
-   - Example: "Foo a = new Foo(); Bar b = a.make();" → children: 'a' (instantiated variable), 'b' (instantiated variable),
-     and 'a' again (comment "source variable for 'b' on same line").
-   - For SAME-NAME children on the SAME line, assign variant indices 0,1,... in left-to-right order of their occurrences on that line.
-5) EXCLUDE:
-   - Instantiations used ONLY as arguments (e.g., "call(new Foo())") → return nothing here.
-   - Unbound 'new' used only in a chain (e.g., "new Foo().init()") → return nothing here.
-   - Anything inside lambda/anonymous-class bodies.
-   - Denylisted trivial/logging utilities.
-6) Focus-aware:
-   - Focus=METHOD: include locals declared/reassigned in that method; do NOT include fields unless receiver is 'this' AND you can infer 'this' is the focus (otherwise exclude).
-   - Focus=OBJECT VAR X: include 'X.field = new T()' as 'field'; include 'Type y = X.make()' as 'y' AND 'X' on that line.
-   - Focus=CALL_RESULT: include 'Var r = <focusCall>().next()' as 'r'.
+STRICT RULES:
+• Children are variables/fields only (never class names).
+• INCLUDE:
+  1) Direct constructor assignment (declaration or reassignment):
+     "Foo f = new Foo(...);"  → child 'f' (code_snippet = entire line; comment "instantiated variable").
+  2) Created from another variable's method call on the same line:
+     "G g = v.create();"      → children 'g' (comment "instantiated variable") AND 'v'
+                                (comment "source variable for 'g' on same line").
+     Chained: "G g = v.create().tune();" → 'g' and 'v' (no 'tune').
+  3) Field assignment on focus object only:
+     "x.helper = new Helper();" with focus 'x' → child 'helper' only (comment "field instantiated on focus").
+  4) Multi-statements SAME line:
+     "Foo a = new Foo(); Bar b = a.make();"
+       → 'a'(instantiated, variant 0), 'b'(instantiated, variant 0), 'a'(source for 'b', variant 1).
 
-For each child produce an EC:
-{"name":"<var or field>", "code_snippet":"<ENTIRE line>", "code_block":"<smallest original block>",
- "further_expand": false, "confidence": 0.0-1.0, "conditioned": false, "guards": [],
- "comment":"<reason as per the cases above>", "variant": <0-based index for same-name in same line>}
+• EXCLUDE:
+  - Instantiation used only as an argument: "call(new Foo())"   → return nothing.
+  - Unbound 'new' chained only: "new Foo().init()"             → return nothing.
+  - Anything inside lambda/anonymous-class bodies.
+  - Trivial/logging utilities (denylist).
+
+• FOCUS SCOPE:
+  - Focus=METHOD: that method body only (exclude lambdas/anon).
+  - Focus=OBJECT VAR X: smallest enclosing block where X is in scope.
+    Include 'X.field = new T()' → child 'field' only.
+    Include 'Var y = X.make()'  → children 'y' and 'X' on that line.
+  - Focus=CALL-RESULT: the statement returning that result; include var declared from it on the same statement.
+
+• VARIANT INDEXING:
+  For each ORIGINAL source line, if the SAME name appears multiple times as separate children,
+  assign 'variant' indices 0,1,... in left-to-right order on that line.
+
+OUTPUT (STRICT JSON ONLY):
+{"children":[
+  {"name":"...", "code_snippet":"<ENTIRE line>", "code_block":"<smallest block>",
+   "further_expand": false, "confidence": 0.0-1.0, "conditioned": false, "guards": [],
+   "comment":"instantiated variable|source variable for '<other>' on same line|field instantiated on focus",
+   "variant": 0}
+]}
 """.strip()
 
-_RUNA_FEWSHOTS = """
-Examples (diverse):
+_PHASE1_FEWSHOTS = """
+Examples:
 
 1) Method focus
 void m(){ Foo f = new Foo(); f.run(); }
-→ children: {"name":"f","comment":"instantiated variable","variant":0}
+→ [{"name":"f","comment":"instantiated variable","variant":0,"code_snippet":"Foo f = new Foo();"}]
 
-2) From another variable's method
-void m(){ Gome g = v.create(); }
-→ children: {"name":"g","comment":"instantiated variable","variant":0},
-            {"name":"v","comment":"source variable for 'g' on same line","variant":0}
+2) Created from another var's method
+void m(){ G g = v.create(); }
+→ [{"name":"g","comment":"instantiated variable","variant":0,"code_snippet":"G g = v.create();"},
+    {"name":"v","comment":"source variable for 'g' on same line","variant":0,"code_snippet":"G g = v.create();"}]
 
 3) Multi-statements same line
 void m(){ Foo a = new Foo(); Bar b = a.make(); }
-→ children: a(instantiated, variant 0), b(instantiated, variant 0), a(source for 'b', variant 1)
+→ [
+  {"name":"a","comment":"instantiated variable","variant":0,"code_snippet":"Foo a = new Foo(); Bar b = a.make();"},
+  {"name":"b","comment":"instantiated variable","variant":0,"code_snippet":"Foo a = new Foo(); Bar b = a.make();"},
+  {"name":"a","comment":"source variable for 'b' on same line","variant":1,"code_snippet":"Foo a = new Foo(); Bar b = a.make();"}
+]
 
-4) Field on focus object
+4) Field on focus
 void m(X x){ x.helper = new Helper(); }
-Focus: x → child: {"name":"helper","comment":"field instantiated on focus","variant":0}
+Focus: x → [{"name":"helper","comment":"field instantiated on focus","variant":0,"code_snippet":"x.helper = new Helper();"}]
 
 5) Exclusions
 void m(){ call(new Foo()); new Bar().init(); items.forEach(t -> { Temp u = new Temp(); }); }
-→ no children for these lines
+→ []
 """.strip()
 
-def _build_run_a_user(
-    *,
-    code: str,
-    focus_name: str,
-    anchor_line: int,
-    anchor_content: str,
-    chain: str,
-    denylist: List[str],
-) -> str:
+def _phase1_build_user(code: str, focus: str, anchor: int, anchor_content: str, chain: str, deny: List[str]) -> str:
     return (
-        f"FOCUS_NAME: {focus_name}\n"
-        f"ANCHOR_LINE (1-based): {anchor_line}\n"
-        f"ANCHOR_LINE_CONTENT: {anchor_content}\n"
-        f"ANALYTICAL_CHAIN (≤2): {chain}\n"
-        f"DENYLIST: {denylist}\n\n"
-        "CODE:\n"
-        f"{code}\n\n"
-        f"{_RUNA_FEWSHOTS}\n"
-        'Output JSON: {"children":[EC,...]} ONLY.'
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EXTRACTOR — Run B: NL per line → re-extract
-# ─────────────────────────────────────────────────────────────────────────────
-
-_EXPLAIN_LINES_SYSTEM = """
-Convert the Java code to concise, factual natural language, ONE sentence per original line (1-based).
-Preserve variable declarations/assignments, 'new' constructs, field assignments, and simple chains.
-Indicate same-line multiple statements in the same original line index.
-Return STRICT JSON: {"lines":[{"line":int,"text":str}, ...]}
-""".strip()
-
-_RUNB_SYSTEM = """
-Using the per-line explanations, repeat the SAME extraction:
-• Return only variable/field children (no class names).
-• If created from another variable’s method call, include both the new variable and the source variable (with comments).
-• For SAME-NAME children on the SAME line, assign variant indices 0,1,... in left-to-right order for that line.
-• Exclude instantiation-only arguments, unbound 'new' chains, lambda/anon internals, denylisted utilities.
-
-Return STRICT JSON: {"children":[EC,...]}. Prefer empty over guesses.
-""".strip()
-
-_RUNB_FEWSHOTS = """
-Hints in NL:
-- "line 7: declare Foo a = new Foo(); then Bar b = a.make()" → a(instantiated, variant 0), b(instantiated, v0), a(source for 'b', v1)
-- "line 12: x.helper assigned new Helper()" with focus x → child 'helper'
-- "line 14: call(new Foo())" → no child
-""".strip()
-
-def _build_run_b_user(
-    *,
-    explained_json: str,
-    focus_name: str,
-    anchor_line: int,
-    anchor_content: str,
-    chain: str,
-    denylist: List[str],
-) -> str:
-    return (
-        f"FOCUS_NAME: {focus_name}\n"
-        f"ANCHOR_LINE (1-based): {anchor_line}\n"
-        f"ANCHOR_LINE_CONTENT: {anchor_content}\n"
-        f"ANALYTICAL_CHAIN (≤2): {chain}\n"
-        f"DENYLIST: {denylist}\n\n"
-        "LINES_NL (JSON array of {line:int,text:str}):\n"
-        f"{explained_json}\n\n"
-        f"{_RUNB_FEWSHOTS}\n"
-        "Return ONLY the JSON object with schema: {'children':[EC,...]}."
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API — extractor
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_object_instantiations(
-    llm: AzureChatOpenAI,
-    *,
-    request: InstantiationInput,
-    denylist: Optional[List[str]] = None,
-) -> List[EC]:
-    """
-    Extract variable/field children created from instantiation under the specified rules.
-    Two runs (original + NL per-line) → merge by (name, code_snippet, comment) to preserve same-name duplicates.
-    """
-    focus = request["object_name"]
-    code = request["java_code"]
-    anchor = int(request["java_code_line"])
-    anchor_content = request.get("java_code_line_content", "")
-    chain = request.get("analytical_chain", "")
-    deny = denylist or DEFAULT_DENYLIST
-
-    # Run A — original code
-    user_a = _build_run_a_user(
-        code=code,
-        focus_name=focus,
-        anchor_line=anchor,
-        anchor_content=anchor_content,
-        chain=chain,
-        denylist=deny,
-    )
-    out_a = _invoke_json(llm, system=_RUNA_SYSTEM, user=user_a)
-    a_children = _norm_ec_list(out_a.get("children", []))
-
-    # Run B — explain → extract
-    explained = _invoke_json(llm, system=_EXPLAIN_LINES_SYSTEM, user="CODE:\n" + code)
-    explained_json = json.dumps(explained.get("lines", []), ensure_ascii=False)
-
-    user_b = _build_run_b_user(
-        explained_json=explained_json,
-        focus_name=focus,
-        anchor_line=anchor,
-        anchor_content=anchor_content,
-        chain=chain,
-        denylist=deny,
-    )
-    out_b = _invoke_json(llm, system=_RUNB_SYSTEM, user=user_b)
-    b_children = _norm_ec_list(out_b.get("children", []))
-
-    # Merge and return
-    return _merge_ecs(a_children, b_children)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VALIDATOR — Object Instantiation
-# ─────────────────────────────────────────────────────────────────────────────
-
-_VALIDATOR_SYSTEM = """
-You validate Object Instantiation children relative to the FOCUS.
-Return STRICT JSON only.
-
-Validity rules:
-• Return children ONLY for variables/fields (never class names).
-• Direct constructor assignment (declaration or reassignment): child is the LHS variable ("instantiated variable").
-• Created from another variable's method call: return TWO children:
-   - new variable (comment "instantiated variable")
-   - source variable (comment "source variable for '<newVar>' on same line")
-• Field on focused object: 'x.field = new T()' with focus 'x' → child 'field' ONLY (comment "field instantiated on focus").
-• Multi-statements on the SAME line: allow duplicate names; SAME-LINE duplicates must have 'variant' indices 0,1,... in left-to-right order.
-• Exclusions: instantiation-only arguments (call(new T())), unbound 'new' chains (new T().init()), lambda/anon internals, denylisted utilities.
-
-For each candidate EC, output:
-{"name":"...","valid":true|false,"confidence":0..1,"reason":"..."}
-""".strip()
-
-_VALIDATOR_FEWSHOTS = """
-Examples:
-
-1) "Foo f = new Foo();" → 'f' valid ("instantiated variable")
-2) "Gome g = v.create();" → 'g' valid; 'v' valid ("source variable for 'g' on same line")
-3) "Foo a = new Foo(); Bar b = a.make();" → 'a'(instantiated, variant 0), 'b'(instantiated, v0), 'a'(source, variant 1) all valid
-4) "x.helper = new Helper();" with focus 'x' → 'helper' valid; 'Helper' invalid
-5) "call(new Foo()); new Bar().init();" → none valid
-""".strip()
-
-def validate_object_instantiations(
-    llm: AzureChatOpenAI,
-    *,
-    request: InstantiationInput,
-    candidates: List[EC],
-    denylist: Optional[List[str]] = None,
-) -> List[VerdictTD]:
-    """
-    Validate Object Instantiation candidates. Returns verdicts with name/valid/confidence/reason.
-    """
-    focus = request["object_name"]
-    code = request["java_code"]
-    anchor = int(request["java_code_line"])
-    anchor_content = request.get("java_code_line_content", "")
-    chain = request.get("analytical_chain", "")
-    deny = denylist or DEFAULT_DENYLIST
-
-    user = (
         f"FOCUS_NAME: {focus}\n"
         f"ANCHOR_LINE (1-based): {anchor}\n"
         f"ANCHOR_LINE_CONTENT: {anchor_content}\n"
         f"ANALYTICAL_CHAIN (≤2): {chain}\n"
         f"DENYLIST: {deny}\n\n"
-        "CANDIDATES (JSON array of EC objects):\n"
-        f"{candidates}\n\n"
-        "CODE:\n"
-        f"{code}\n\n"
-        f"{_VALIDATOR_FEWSHOTS}\n"
-        'Output schema: {"verdicts":[{"name":"...","valid":true|false,"confidence":0.0,"reason":"..."}]}\n'
+        "CODE:\n" + code + "\n\n" +
+        _PHASE1_FEWSHOTS + "\n"
         "Return ONLY the JSON object."
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase-2 — Eligible uses (no NL pass)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PHASE2_SYSTEM = """
+You extract ELIGIBLE VARIABLE USES within the FOCUS SCOPE for:
+  • the given Phase-1 variable names (created in-scope)
+  • and (optional) variables that are EXTERNAL but used in-scope (label them).
+
+INCLUDE (examples):
+  - Receiver call on var:                   v.m(...), ((T)v).m(...)
+  - Field read/write of var:                v.f, v.f = ..., x = v.f
+  - Assigned-from / producer:               R r = v.make(...);   r = v;
+  - Control/return use:                     if (v != null) {...}   return v;
+  - Non-call array/collection assignment:   arr[i] = v;   x = v;
+
+EXCLUDE:
+  - ANY case where the variable is passed as a method/constructor ARGUMENT: call(v), sink.accept(v), new Foo(v) → exclude
+  - Anything inside lambda/anonymous-class bodies
+  - Trivial/logging utilities (denylist) as receivers/callees
+
+External used in scope:
+  - If include_external=true and a variable is used in this scope without an in-scope declaration/instantiation,
+    emit an EC with comment "external used in scope" (combined with the specific usage comment).
+
+Variant indexing:
+  - For each ORIGINAL source line, if the SAME name appears multiple times as separate uses,
+    assign variant indices 0,1,... in left-to-right order on that line.
+
+OUTPUT (STRICT JSON ONLY):
+{"children":[
+  {"name":"<var>", "code_snippet":"<ENTIRE line>", "code_block":"<smallest block>",
+   "further_expand": false, "confidence": 0.0-1.0, "conditioned": false, "guards": [],
+   "comment":"used as receiver|used in field read|used in field write|used in assignment|used in return|used in condition|external used in scope|used as array/collection element target|used as array/collection value",
+   "variant": 0}
+]}
+""".strip()
+
+_PHASE2_FEWSHOTS = """
+Examples:
+
+1) Receiver call
+void m(){ v.m(); } with phase1_vars=['v']
+→ [{"name":"v","comment":"used as receiver","variant":0,"code_snippet":"v.m();"}]
+
+2) Field read/write
+x = v.f;        → {"name":"v","comment":"used in field read","variant":0,"code_snippet":"x = v.f;"}
+v.f = y;        → {"name":"v","comment":"used in field write","variant":0,"code_snippet":"v.f = y;"}
+
+3) Producer / assignment
+R r = v.make(); → {"name":"v","comment":"used in assignment","variant":0,"code_snippet":"R r = v.make();"}
+r = v;          → {"name":"v","comment":"used in assignment","variant":0,"code_snippet":"r = v;"}
+
+4) Control / return
+if (v != null) return v; → two ECs for 'v' on same line with variant 0,1
+
+5) Array/collection (non-call)
+arr[i] = v; → {"name":"v","comment":"used as array/collection value","variant":0}
+
+6) EXCLUDE argument use
+call(v); sink.accept(v); new Foo(v); → exclude
+
+7) External used in scope
+void m(){ if (p != null) p.m(); } include_external=true, phase1_vars=[]
+→ emit 'p' twice with comments including "external used in scope"
+""".strip()
+
+def _phase2_build_user(
+    *, code: str, focus: str, anchor: int, anchor_content: str, chain: str,
+    deny: List[str], phase1_vars: List[str], include_external: bool
+) -> str:
+    return (
+        f"FOCUS_NAME: {focus}\n"
+        f"ANCHOR_LINE (1-based): {anchor}\n"
+        f"ANCHOR_LINE_CONTENT: {anchor_content}\n"
+        f"ANALYTICAL_CHAIN (≤2): {chain}\n"
+        f"DENYLIST: {deny}\n"
+        f"PHASE1_VARS: {phase1_vars}\n"
+        f"INCLUDE_EXTERNAL: {include_external}\n\n"
+        "CODE:\n" + code + "\n\n" +
+        _PHASE2_FEWSHOTS + "\n"
+        "Return ONLY the JSON object."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single relationship validator (Phase-1 + Phase-2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VALIDATOR_SYSTEM = """
+You validate the RELATIONSHIP between Phase-1 instantiations and Phase-2 eligible uses under the focus scope.
+
+Validate the following:
+
+A) Phase-1 instantiations:
+   • Each child is a variable/field created in-scope:
+     - Direct 'new' assignment → comment "instantiated variable"
+     - Created from another variable's method call → TWO children: new var + source var ("source variable for '<new>' on same line")
+     - Field on focus object: x.field = new T() → 'field' only ("field instantiated on focus")
+   • NO entries for:
+     - 'new' used only as an argument (call(new T()))
+     - Unbound 'new' immediately chained (new T().init())
+     - Lambdas/anonymous-class bodies
+   • SAME-LINE duplicates carry variant 0,1,... left-to-right.
+
+B) Phase-2 uses:
+   • Each usage is in-scope and matches allowed categories:
+     - receiver, field read/write, assignment, return, condition, array/collection (non-call)
+   • EXCLUDES any argument use (call(v), new Foo(v), ...)
+   • If include_external=true and var not created/declared in-scope, "external used in scope" tag in comment is acceptable.
+   • SAME-LINE duplicates carry variant 0,1,... left-to-right.
+
+C) Cross-check (relationship):
+   • Every Phase-2 use of a name that was created in Phase-1 should be consistent (same scope, not argument position).
+   • If a Phase-2 'name' was not in Phase-1 and include_external=true, it must be plausibly external-in-scope (param/field/outer var).
+   • Variables created from 'v.create()' in Phase-1 must NOT appear as "argument use" in Phase-2 (those are excluded).
+   • No class names are used as EC 'name'.
+
+Return STRICT JSON ONLY:
+{"verdicts":[{"name":"<scope-label or variable>", "valid":true|false, "confidence":0.0-1.0, "reason":"..."}]}
+""".strip()
+
+
+def _validator_build_user(
+    *, code: str, focus: str, anchor: int, anchor_content: str, chain: str, deny: List[str],
+    instantiations: List[EC], uses: List[EC], include_external: bool
+) -> str:
+    return (
+        f"FOCUS_NAME: {focus}\n"
+        f"ANCHOR_LINE (1-based): {anchor}\n"
+        f"ANCHOR_LINE_CONTENT: {anchor_content}\n"
+        f"ANALYTICAL_CHAIN (≤2): {chain}\n"
+        f"DENYLIST: {deny}\n"
+        f"INCLUDE_EXTERNAL: {include_external}\n\n"
+        "PHASE1_INSTANTIATIONS (EC[]):\n" + json.dumps(instantiations, ensure_ascii=False) + "\n\n"
+        "PHASE2_USES (EC[]):\n" + json.dumps(uses, ensure_ascii=False) + "\n\n"
+        "CODE:\n" + code + "\n"
+        "Return ONLY the JSON object."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_instantiation_usage_pipeline(
+    llm: AzureChatOpenAI,
+    *,
+    request: PipelineInput,
+    denylist: Optional[List[str]] = None,
+) -> PipelineResult:
+    """
+    Runs Phase-1 then Phase-2. Returns {'instantiations': [...], 'uses': [...] }.
+    """
+    focus = request["object_name"]
+    code = request["java_code"]
+    anchor = int(request["java_code_line"])
+    anchor_content = request.get("java_code_line_content", "")
+    chain = request.get("analytical_chain", "")
+    include_external = bool(request.get("include_external_uses", True))
+    deny = denylist or DEFAULT_DENYLIST
+
+    # Phase-1
+    user1 = _phase1_build_user(code, focus, anchor, anchor_content, chain, deny)
+    out1 = _invoke_json(llm, system=_PHASE1_SYSTEM, user=user1)
+    insts = _norm_ec_list(out1.get("children", []))
+
+    # Collect Phase-1 var names that represent actual new variables/fields
+    # (We include all names from Phase-1; you can filter to comments==["instantiated variable", "field instantiated on focus"] if desired.)
+    phase1_var_names: Set[str] = {ec["name"] for ec in insts}
+
+    # Phase-2
+    user2 = _phase2_build_user(
+        code=code, focus=focus, anchor=anchor, anchor_content=anchor_content, chain=chain,
+        deny=deny, phase1_vars=sorted(phase1_var_names), include_external=include_external
+    )
+    out2 = _invoke_json(llm, system=_PHASE2_SYSTEM, user=user2)
+    uses = _norm_ec_list(out2.get("children", []))
+
+    return {"instantiations": insts, "uses": uses}
+
+
+def validate_instantiation_usage_relationship(
+    llm: AzureChatOpenAI,
+    *,
+    request: PipelineInput,
+    pipeline_result: PipelineResult,
+    denylist: Optional[List[str]] = None,
+) -> List[VerdictTD]:
+    """
+    Validates Phase-1 + Phase-2 relationship in one shot. Returns verdict list.
+    """
+    focus = request["object_name"]
+    code = request["java_code"]
+    anchor = int(request["java_code_line"])
+    anchor_content = request.get("java_code_line_content", "")
+    chain = request.get("analytical_chain", "")
+    include_external = bool(request.get("include_external_uses", True))
+    deny = denylist or DEFAULT_DENYLIST
+
+    insts = pipeline_result.get("instantiations", [])
+    uses = pipeline_result.get("uses", [])
+
+    user = _validator_build_user(
+        code=code, focus=focus, anchor=anchor, anchor_content=anchor_content, chain=chain,
+        deny=deny, instantiations=insts, uses=uses, include_external=include_external
+    )
     out = _invoke_json(llm, system=_VALIDATOR_SYSTEM, user=user)
-    verd = out.get("verdicts", [])
-    cleaned: List[VerdictTD] = []
-    for v in verd:
+    verdicts_raw = out.get("verdicts", [])
+    verdicts: List[VerdictTD] = []
+    for v in verdicts_raw:
         nm = str(v.get("name", "")).strip()
         if not nm:
             continue
@@ -395,12 +434,11 @@ def validate_object_instantiations(
             conf = float(v.get("confidence", 0.0))
         except Exception:
             conf = 0.0
-        if conf < 0.0: conf = 0.0
-        if conf > 1.0: conf = 1.0
-        cleaned.append({
+        conf = max(0.0, min(1.0, conf))
+        verdicts.append({
             "name": nm,
             "valid": bool(v.get("valid", False)),
             "confidence": conf,
             "reason": str(v.get("reason", "")).strip(),
         })
-    return cleaned
+    return verdicts
